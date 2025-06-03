@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"text/template"
 	"time"
@@ -96,6 +97,7 @@ type Configuration struct {
 	AllowEmptyServices bool            `description:"Allow the creation of services without endpoints." json:"allowEmptyServices,omitempty" toml:"allowEmptyServices,omitempty" yaml:"allowEmptyServices,omitempty" export:"true"`
 	Watch              bool            `description:"Watch Nomad Service events." json:"watch,omitempty" toml:"watch,omitempty" yaml:"watch,omitempty" export:"true"`
 	ThrottleDuration   ptypes.Duration `description:"Watch throttle duration." json:"throttleDuration,omitempty" toml:"throttleDuration,omitempty" yaml:"throttleDuration,omitempty" export:"true"`
+	UseServiceCache    bool            `description:"Use a service cache to store Nomad services." json:"useServiceCache,omitempty" toml:"useServiceCache,omitempty" yaml:"useServiceCache,omitempty" export:"true"`
 }
 
 // SetDefaults sets the default values for the Nomad Traefik Provider Configuration.
@@ -121,6 +123,7 @@ func (c *Configuration) SetDefaults() {
 	c.RefreshInterval = ptypes.Duration(15 * time.Second)
 	c.DefaultRule = defaultTemplateRule
 	c.ThrottleDuration = ptypes.Duration(0)
+	c.UseServiceCache = false
 }
 
 type EndpointConfig struct {
@@ -143,6 +146,8 @@ type Provider struct {
 	client         *api.Client        // client for Nomad API
 	defaultRuleTpl *template.Template // default routing rule
 
+	serviceCache *serviceCache // cache for services
+
 	lastConfiguration safe.Safe
 }
 
@@ -157,8 +162,12 @@ func (p *Provider) Init() error {
 		return errors.New("wildcard namespace not supported")
 	}
 
-	if p.ThrottleDuration > 0 && !p.Watch {
+	if p.ThrottleDuration > 0 && !(p.Watch || p.UseServiceCache) {
 		return errors.New("throttle duration should not be used with polling mode")
+	}
+
+	if p.UseServiceCache && p.Watch {
+		return errors.New("service cache and watch mode cannot be used together")
 	}
 
 	defaultRuleTpl, err := provider.MakeDefaultRuleTemplate(p.DefaultRule, nil)
@@ -192,7 +201,7 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 			ctx, cancel := context.WithCancel(ctxLog)
 			defer cancel()
 
-			serviceEventsChan, err := p.pollOrWatch(ctx)
+			serviceEventsChan, err := p.pollOrWatchOrCache(ctx)
 			if err != nil {
 				return fmt.Errorf("watching Nomad events: %w", err)
 			}
@@ -220,15 +229,28 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 				select {
 				case <-ctx.Done():
 					return nil
-				case event := <-serviceEventsChan:
+				case event, ok := <-serviceEventsChan:
+					if !ok {
+						// If the channel is closed, we return an error to stop the provider.
+						return fmt.Errorf("service events channel closed")
+					}
+
+					// Check for nil event to prevent nil pointer dereference
+					if event == nil {
+						logger.Warn().Msg("Received nil event from service events channel")
+						continue
+					}
+
 					conf, err = p.loadConfiguration(ctx)
 					if err != nil {
 						return fmt.Errorf("loading configuration: %w", err)
 					}
+
 					updated, err := p.updateLastConfiguration(conf)
 					if err != nil {
 						return fmt.Errorf("updating last configuration: %w", err)
 					}
+
 					if !updated {
 						logger.Debug().Msgf("Skipping Nomad event %d with no changes", event.Index)
 						continue
@@ -263,13 +285,34 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 	return nil
 }
 
-func (p *Provider) pollOrWatch(ctx context.Context) (<-chan *api.Events, error) {
+func (p *Provider) pollOrWatchOrCache(ctx context.Context) (<-chan *api.Events, error) {
+	if p.UseServiceCache {
+		p.serviceCache = newServiceCache(p.filterService, p.getExtraConf, p.client.EventStream(), p.client.Services(), p.Stale)
+
+		lastIndex, err := p.serviceCache.initCache(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("initializing service cache: %w", err)
+		}
+
+		serviceEventsChan := make(chan *api.Events, 1)
+
+		go func() {
+			defer close(serviceEventsChan)
+
+			if err := p.serviceCache.run(ctx, lastIndex, serviceEventsChan); err != nil {
+				log.Ctx(ctx).Err(err).Msg("error running service cache")
+			}
+		}()
+
+		return serviceEventsChan, nil
+	}
+
 	if p.Watch {
 		return p.client.EventStream().Stream(ctx,
 			map[api.Topic][]string{
 				api.TopicService: {"*"},
 			},
-			0,
+			math.MaxInt64, // We're only interested in new events
 			&api.QueryOptions{
 				Namespace: p.namespace,
 			},
@@ -330,11 +373,12 @@ func (p *Provider) updateLastConfiguration(conf *dynamic.Configuration) (bool, e
 }
 
 func (p *Provider) getNomadServiceData(ctx context.Context) ([]item, error) {
-	// first, get list of service stubs
-	opts := &api.QueryOptions{AllowStale: p.Stale}
-	opts = opts.WithContext(ctx)
 
-	stubs, _, err := p.client.Services().List(opts)
+	if p.UseServiceCache {
+		return p.serviceCache.getNomadServiceData(ctx)
+	}
+
+	stubs, err := p.listServices(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -343,22 +387,8 @@ func (p *Provider) getNomadServiceData(ctx context.Context) ([]item, error) {
 
 	for _, stub := range stubs {
 		for _, service := range stub.Services {
-			logger := log.Ctx(ctx).With().Str("serviceName", service.ServiceName).Logger()
 
-			extraConf := p.getExtraConf(service.Tags)
-			if !extraConf.Enable {
-				logger.Debug().Msg("Filter Nomad service that is not enabled")
-				continue
-			}
-
-			matches, err := constraints.MatchTags(service.Tags, p.Constraints)
-			if err != nil {
-				logger.Error().Err(err).Msg("Error matching constraint expressions")
-				continue
-			}
-
-			if !matches {
-				logger.Debug().Msgf("Filter Nomad service not matching constraints: %q", p.Constraints)
+			if !p.filterService(ctx, service.ServiceName, service.Tags) {
 				continue
 			}
 
@@ -418,22 +448,8 @@ func (p *Provider) getNomadServiceDataWithEmptyServices(ctx context.Context) ([]
 			}
 
 			for _, service := range services {
-				logger := log.Ctx(ctx).With().Str("serviceName", service.TaskName).Logger()
 
-				extraConf := p.getExtraConf(service.Tags)
-				if !extraConf.Enable {
-					logger.Debug().Msg("Filter Nomad service that is not enabled")
-					continue
-				}
-
-				matches, err := constraints.MatchTags(service.Tags, p.Constraints)
-				if err != nil {
-					logger.Error().Err(err).Msg("Error matching constraint expressions")
-					continue
-				}
-
-				if !matches {
-					logger.Debug().Msgf("Filter Nomad service not matching constraints: %q", p.Constraints)
+				if !p.filterService(ctx, service.TaskName, service.Tags) {
 					continue
 				}
 
@@ -478,6 +494,30 @@ func (p *Provider) getNomadServiceDataWithEmptyServices(ctx context.Context) ([]
 	return items, nil
 }
 
+// filterService checks if a service should be exposed by Traefik.
+func (p *Provider) filterService(ctx context.Context, serviceName string, tags []string) bool {
+	logger := log.Ctx(ctx).With().Str("serviceName", serviceName).Logger()
+
+	extraConf := p.getExtraConf(tags)
+	if !extraConf.Enable {
+		logger.Debug().Msg("Filter Nomad service that is not enabled")
+		return false
+	}
+
+	matches, err := constraints.MatchTags(tags, p.Constraints)
+	if err != nil {
+		logger.Error().Err(err).Msg("Error matching constraint expressions")
+		return false
+	}
+
+	if !matches {
+		logger.Debug().Msgf("Filter Nomad service not matching constraints: %q", p.Constraints)
+		return false
+	}
+
+	return true
+}
+
 // getExtraConf returns a configuration with settings which are not part of the dynamic configuration (e.g. "<prefix>.enable").
 func (p *Provider) getExtraConf(tags []string) configuration {
 	labels := tagsToLabels(tags, p.Prefix)
@@ -495,9 +535,32 @@ func (p *Provider) getExtraConf(tags []string) configuration {
 	return configuration{Enable: enabled, Canary: canary}
 }
 
+// listServices queries Nomad API for all services.
+func (p *Provider) listServices(ctx context.Context) ([]*api.ServiceRegistrationListStub, error) {
+	if p.UseServiceCache {
+		return p.serviceCache.listServices(ctx)
+	}
+
+	// first, get list of service stubs
+	opts := &api.QueryOptions{AllowStale: p.Stale}
+	opts = opts.WithContext(ctx)
+
+	stubs, _, err := p.client.Services().List(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return stubs, nil
+}
+
 // fetchService queries Nomad API for services matching name,
 // that also have the  <prefix>.enable=true set in its tags.
 func (p *Provider) fetchService(ctx context.Context, name string) ([]*api.ServiceRegistration, error) {
+
+	if p.UseServiceCache {
+		return p.serviceCache.fetchService(ctx, name)
+	}
+
 	var tagFilter string
 	if !p.ExposedByDefault {
 		tagFilter = fmt.Sprintf(`Tags contains %q`, fmt.Sprintf("%s.enable=true", p.Prefix))
@@ -551,14 +614,23 @@ func throttleEvents(ctx context.Context, throttleDuration time.Duration, pool *s
 	// eventChan will never block, and that pendingEvent will have
 	// something in it if there's been an event since we read from that channel.
 	pool.GoCtx(func(ctxPool context.Context) {
+		defer close(eventsChanBuffered)
+
 		for {
 			select {
 			case <-ctxPool.Done():
 				return
-			case nextEvent := <-eventsChan:
+			case nextEvent, ok := <-eventsChan:
+				if !ok {
+					return
+				}
 				select {
 				case eventsChanBuffered <- nextEvent:
 				default:
+					if nextEvent == nil || nextEvent.IsHeartbeat() {
+						continue
+					}
+
 					// We already have an event in eventsChanBuffered, so we'll
 					// do a refresh as soon as our throttle allows us to. It's fine
 					// to drop the event and keep whatever's in the buffer -- we
